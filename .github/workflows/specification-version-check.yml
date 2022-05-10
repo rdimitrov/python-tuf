@@ -2,6 +2,7 @@ on:
   schedule:
     - cron: "0 13 * * *"
   workflow_dispatch:
+  push:
 name: Specification version check
 jobs:
   # Get the version of the TUF specification the project states it supports
@@ -23,8 +24,8 @@ jobs:
   specification-bump-check:
     permissions:
       contents: read
-      issues: write
+      issues: read
     needs: get-supported-tuf-version
-    uses: theupdateframework/specification/.github/workflows/check-latest-spec-version.yml@master
+    uses: rdimitrov/specification/.github/workflows/check-latest-spec-version.yml@dimitrovr/spec-bump-workflow
     with:
       tuf-version: ${{needs.get-supported-tuf-version.outputs.version}}
