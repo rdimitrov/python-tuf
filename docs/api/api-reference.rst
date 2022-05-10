@@ -18,12 +18,10 @@ TUF provides multiple APIs:
   is implemented on top of the Metadata API and can be used to implement
   various TUF clients with relatively little effort.
 
-.. note:: Major API changes are unlikely but these APIs are not yet
-   considered stable, and a higher-level repository operations API is not yet
-   included.
+Code `examples <https://github.com/theupdateframework/python-tuf/tree/develop/examples>`_
+are available for client implementation using ngclient and a
+basic repository using Metadata API.
 
-   There is a legacy implementation in the source code (not covered by this
-   documentation): it is in maintenance mode and receives no feature work.
 
 .. toctree::
    :maxdepth: 2

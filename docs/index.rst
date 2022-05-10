@@ -13,7 +13,8 @@ systems.
 .. toctree::
    :maxdepth: 1
    :caption: Contents:
-   
+
    api/api-reference
-   CONTRIBUTORS
    INSTALLATION
+   Usage examples <https://github.com/theupdateframework/python-tuf/tree/develop/examples>
+   Contribute <CONTRIBUTING>

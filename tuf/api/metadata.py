@@ -1,27 +1,38 @@
 # Copyright New York University and the TUF contributors
 # SPDX-License-Identifier: MIT OR Apache-2.0
 
-"""TUF role metadata model.
+"""
+The low-level Metadata API in ``tuf.api.metadata`` module contains:
 
-This module provides container classes for TUF role metadata, including methods
-to read and write from and to file, perform TUF-compliant metadata updates, and
-create and verify signatures.
+* Safe de/serialization of metadata to and from files.
+* Access to and modification of signed metadata content.
+* Signing metadata and verifying signatures.
 
-The metadata model supports any custom serialization format, defaulting to JSON
-as wireline format and Canonical JSON for reproducible signature creation and
-verification.
-Custom serializers must implement the abstract serialization interface defined
-in 'tuf.api.serialization', and may use the [to|from]_dict convenience methods
-available in the class model.
+Metadata API implements functionality at the metadata file level, it does
+not provide TUF repository or client functionality on its own (but can be used
+to implement them).
 
+The API design is based on the file format defined in the `TUF specification
+<https://theupdateframework.github.io/specification/latest/>`_ and the object
+attributes generally follow the JSON format used in the specification.
+
+The above principle means that a ``Metadata`` object represents a single
+metadata file, and has a ``signed`` attribute that is an instance of one of the
+four top level signed classes (``Root``, ``Timestamp``, ``Snapshot`` and ``Targets``).
+To make Python type annotations useful ``Metadata`` can be type constrained: e.g. the
+signed attribute of ``Metadata[Root]`` is known to be ``Root``.
+
+Currently Metadata API supports JSON as the file format.
+
+A basic example of repository implementation using the Metadata is available in
+`examples/repo_example <https://github.com/theupdateframework/python-tuf/tree/develop/examples/repo_example>`_.
 """
 import abc
 import fnmatch
 import io
 import logging
 import tempfile
-from collections import OrderedDict
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import (
     IO,
     Any,
@@ -45,12 +56,18 @@ from securesystemslib.signer import Signature, Signer
 from securesystemslib.storage import FilesystemBackend, StorageBackendInterface
 from securesystemslib.util import persist_temp_file
 
-from tuf import exceptions
+from tuf.api import exceptions
 from tuf.api.serialization import (
     MetadataDeserializer,
     MetadataSerializer,
+    SerializationError,
     SignedSerializer,
 )
+
+_ROOT = "root"
+_SNAPSHOT = "snapshot"
+_TARGETS = "targets"
+_TIMESTAMP = "timestamp"
 
 # pylint: disable=too-many-lines
 
@@ -58,7 +75,8 @@ logger = logging.getLogger(__name__)
 
 # We aim to support SPECIFICATION_VERSION and require the input metadata
 # files to have the same major version (the first number) as ours.
-SPECIFICATION_VERSION = ["1", "0", "19"]
+SPECIFICATION_VERSION = ["1", "0", "29"]
+TOP_LEVEL_ROLE_NAMES = {_ROOT, _TIMESTAMP, _SNAPSHOT, _TARGETS}
 
 # T is a Generic type constraint for Metadata.signed
 T = TypeVar("T", "Root", "Timestamp", "Snapshot", "Targets")
@@ -70,9 +88,10 @@ class Metadata(Generic[T]):
     Provides methods to convert to and from dictionary, read and write to and
     from file and to create and verify metadata signatures.
 
-    Metadata[T] is a generic container type where T can be any one type of
-    [Root, Timestamp, Snapshot, Targets]. The purpose of this is to allow
-    static type checking of the signed attribute in code using Metadata::
+    ``Metadata[T]`` is a generic container type where T can be any one type of
+    [``Root``, ``Timestamp``, ``Snapshot``, ``Targets``]. The purpose of this
+    is to allow static type checking of the signed attribute in code using
+    Metadata::
 
         root_md = Metadata[Root].from_file("root.json")
         # root_md type is now Metadata[Root]. This means signed and its
@@ -82,54 +101,89 @@ class Metadata(Generic[T]):
 
     Using a type constraint is not required but not doing so means T is not a
     specific type so static typing cannot happen. Note that the type constraint
-    "[Root]" is not validated at runtime (as pure annotations are not available
+    ``[Root]`` is not validated at runtime (as pure annotations are not available
     then).
 
-    Attributes:
-        signed: A subclass of Signed, which has the actual metadata payload,
-            i.e. one of Targets, Snapshot, Timestamp or Root.
-        signatures: An ordered dictionary of keyids to Signature objects, each
-            signing the canonical serialized representation of 'signed'.
+    New Metadata instances can be created from scratch with::
+
+        one_day = datetime.utcnow() + timedelta(days=1)
+        timestamp = Metadata(Timestamp(expires=one_day))
+
+    Apart from ``expires`` all of the arguments to the inner constructors have
+    reasonable default values for new metadata.
+
+    *All parameters named below are not just constructor arguments but also
+    instance attributes.*
+
+    Args:
+        signed: Actual metadata payload, i.e. one of ``Targets``,
+            ``Snapshot``, ``Timestamp`` or ``Root``.
+        signatures: Ordered dictionary of keyids to ``Signature`` objects, each
+            signing the canonical serialized representation of ``signed``.
+            Default is an empty dictionary.
+        unrecognized_fields: Dictionary of all attributes that are not managed
+            by TUF Metadata API. These fields are NOT signed and it's preferable
+            if unrecognized fields are added to the Signed derivative classes.
     """
 
-    def __init__(self, signed: T, signatures: "OrderedDict[str, Signature]"):
+    def __init__(
+        self,
+        signed: T,
+        signatures: Optional[Dict[str, Signature]] = None,
+        unrecognized_fields: Optional[Dict[str, Any]] = None,
+    ):
         self.signed: T = signed
-        self.signatures = signatures
+        self.signatures = signatures if signatures is not None else {}
+        if unrecognized_fields is None:
+            unrecognized_fields = {}
+
+        self.unrecognized_fields = unrecognized_fields
+
+    def __eq__(self, other: Any) -> bool:
+        if not isinstance(other, Metadata):
+            return False
+
+        return (
+            self.signatures == other.signatures
+            # Order of the signatures matters (see issue #1788).
+            and list(self.signatures.items()) == list(other.signatures.items())
+            and self.signed == other.signed
+            and self.unrecognized_fields == other.unrecognized_fields
+        )
 
     @classmethod
     def from_dict(cls, metadata: Dict[str, Any]) -> "Metadata[T]":
-        """Creates Metadata object from its dict representation.
+        """Creates ``Metadata`` object from its json/dict representation.
 
-        Arguments:
+        Args:
             metadata: TUF metadata in dict representation.
 
         Raises:
-            KeyError: The metadata dict format is invalid.
-            ValueError: The metadata has an unrecognized signed._type field.
+            ValueError, KeyError, TypeError: Invalid arguments.
 
         Side Effect:
             Destroys the metadata dict passed by reference.
 
         Returns:
-            A TUF Metadata object.
+            TUF ``Metadata`` object.
         """
 
         # Dispatch to contained metadata class on metadata _type field.
         _type = metadata["signed"]["_type"]
 
-        if _type == "targets":
+        if _type == _TARGETS:
             inner_cls: Type[Signed] = Targets
-        elif _type == "snapshot":
+        elif _type == _SNAPSHOT:
             inner_cls = Snapshot
-        elif _type == "timestamp":
+        elif _type == _TIMESTAMP:
             inner_cls = Timestamp
-        elif _type == "root":
+        elif _type == _ROOT:
             inner_cls = Root
         else:
             raise ValueError(f'unrecognized metadata type "{_type}"')
 
         # Make sure signatures are unique
-        signatures: "OrderedDict[str, Signature]" = OrderedDict()
+        signatures: Dict[str, Signature] = {}
         for sig_dict in metadata.pop("signatures"):
             sig = Signature.from_dict(sig_dict)
             if sig.keyid in signatures:
@@ -142,6 +196,8 @@ class Metadata(Generic[T]):
             # Specific type T is not known at static type check time: use cast
             signed=cast(T, inner_cls.from_dict(metadata.pop("signed"))),
             signatures=signatures,
+            # All fields left in the metadata dict are unrecognized.
+            unrecognized_fields=metadata,
         )
 
     @classmethod
@@ -153,22 +209,21 @@ class Metadata(Generic[T]):
     ) -> "Metadata[T]":
         """Loads TUF metadata from file storage.
 
-        Arguments:
-            filename: The path to read the file from.
-            deserializer: A MetadataDeserializer subclass instance that
+        Args:
+            filename: Path to read the file from.
+            deserializer: ``MetadataDeserializer`` subclass instance that
                 implements the desired wireline format deserialization. Per
-                default a JSONDeserializer is used.
-            storage_backend: An object that implements
-                securesystemslib.storage.StorageBackendInterface. Per default
-                a (local) FilesystemBackend is used.
-
+                default a ``JSONDeserializer`` is used.
+            storage_backend: Object that implements
+                ``securesystemslib.storage.StorageBackendInterface``.
+                Default is ``FilesystemBackend`` (i.e. a local file).
         Raises:
-            securesystemslib.exceptions.StorageError: The file cannot be read.
+            exceptions.StorageError: The file cannot be read.
             tuf.api.serialization.DeserializationError:
                 The file cannot be deserialized.
 
         Returns:
-            A TUF Metadata object.
+            TUF ``Metadata`` object.
         """
 
         if storage_backend is None:
@@ -185,17 +240,17 @@ class Metadata(Generic[T]):
     ) -> "Metadata[T]":
         """Loads TUF metadata from raw data.
 
-        Arguments:
-            data: metadata content as bytes.
-            deserializer: Optional; A MetadataDeserializer instance that
-                implements deserialization. Default is JSONDeserializer.
+        Args:
+            data: Metadata content.
+            deserializer: ``MetadataDeserializer`` implementation to use.
+                Default is ``JSONDeserializer``.
 
         Raises:
             tuf.api.serialization.DeserializationError:
                 The file cannot be deserialized.
 
         Returns:
-            A TUF Metadata object.
+            TUF ``Metadata`` object.
         """
 
         if deserializer is None:
@@ -212,9 +267,16 @@ class Metadata(Generic[T]):
     ) -> bytes:
         """Return the serialized TUF file format as bytes.
 
-        Arguments:
-            serializer: A MetadataSerializer instance that implements the
-                desired serialization format. Default is JSONSerializer.
+        Note that if bytes are first deserialized into ``Metadata`` and then
+        serialized with ``to_bytes()``, the two are not required to be
+        identical even though the signatures are guaranteed to stay valid. If
+        byte-for-byte equivalence is required (which is the case when content
+        hashes are used in other metadata), the original content should be used
+        instead of re-serializing.
+
+        Args:
+            serializer: ``MetadataSerializer`` instance that implements the
+                desired serialization format. Default is ``JSONSerializer``.
 
         Raises:
             tuf.api.serialization.SerializationError:
@@ -235,7 +297,11 @@ class Metadata(Generic[T]):
 
         signatures = [sig.to_dict() for sig in self.signatures.values()]
 
-        return {"signatures": signatures, "signed": self.signed.to_dict()}
+        return {
+            "signatures": signatures,
+            "signed": self.signed.to_dict(),
+            **self.unrecognized_fields,
+        }
 
     def to_file(
         self,
@@ -245,18 +311,24 @@ class Metadata(Generic[T]):
     ) -> None:
         """Writes TUF metadata to file storage.
 
-        Arguments:
-            filename: The path to write the file to.
-            serializer: A MetadataSerializer instance that implements the
-                desired serialization format. Default is JSONSerializer.
-            storage_backend: A StorageBackendInterface implementation. Default
-                is FilesystemBackend (i.e. a local file).
+        Note that if a file is first deserialized into ``Metadata`` and then
+        serialized with ``to_file()``, the two files are not required to be
+        identical even though the signatures are guaranteed to stay valid. If
+        byte-for-byte equivalence is required (which is the case when file
+        hashes are used in other metadata), the original file should be used
+        instead of re-serializing.
+
+        Args:
+            filename: Path to write the file to.
+            serializer: ``MetadataSerializer`` instance that implements the
+                desired serialization format. Default is ``JSONSerializer``.
+            storage_backend: ``StorageBackendInterface`` implementation. Default
+                is ``FilesystemBackend`` (i.e. a local file).
 
         Raises:
             tuf.api.serialization.SerializationError:
                 The metadata object cannot be serialized.
-            securesystemslib.exceptions.StorageError:
-                The file cannot be written.
+            exceptions.StorageError: The file cannot be written.
         """
 
         bytes_data = self.to_bytes(serializer)
@@ -272,25 +344,26 @@ class Metadata(Generic[T]):
         append: bool = False,
         signed_serializer: Optional[SignedSerializer] = None,
     ) -> Signature:
-        """Creates signature over 'signed' and assigns it to 'signatures'.
+        """Creates signature over ``signed`` and assigns it to ``signatures``.
 
-        Arguments:
-            signer: A securesystemslib.signer.Signer implementation.
-            append: A boolean indicating if the signature should be appended to
+        Args:
+            signer: A ``securesystemslib.signer.Signer`` object that provides a private
+                key and signing implementation to generate the signature. A standard
+                implementation is available in ``securesystemslib.signer.SSlibSigner``.
+            append: ``True`` if the signature should be appended to
                 the list of signatures or replace any existing signatures. The
                 default behavior is to replace signatures.
-            signed_serializer: A SignedSerializer that implements the desired
-                serialization format. Default is CanonicalJSONSerializer.
+            signed_serializer: ``SignedSerializer`` that implements the desired
+                serialization format. Default is ``CanonicalJSONSerializer``.
 
         Raises:
             tuf.api.serialization.SerializationError:
-                'signed' cannot be serialized.
-            securesystemslib.exceptions.CryptoError, \
-                    securesystemslib.exceptions.UnsupportedAlgorithmError:
-                Signing errors.
+                ``signed`` cannot be serialized.
+            exceptions.UnsignedMetadataError: Signing errors.
 
         Returns:
-            Securesystemslib Signature object that was added into signatures.
+            ``securesystemslib.signer.Signature`` object that was added into
+            signatures.
         """
 
         if signed_serializer is None:
@@ -300,7 +373,14 @@ class Metadata(Generic[T]):
 
             signed_serializer = CanonicalJSONSerializer()
 
-        signature = signer.sign(signed_serializer.serialize(self.signed))
+        bytes_data = signed_serializer.serialize(self.signed)
+
+        try:
+            signature = signer.sign(bytes_data)
+        except Exception as e:
+            raise exceptions.UnsignedMetadataError(
+                "Problem signing the metadata"
+            ) from e
 
         if not append:
             self.signatures.clear()
@@ -315,18 +395,20 @@ class Metadata(Generic[T]):
         delegated_metadata: "Metadata",
         signed_serializer: Optional[SignedSerializer] = None,
     ) -> None:
-        """Verifies that 'delegated_metadata' is signed with the required
-        threshold of keys for the delegated role 'delegated_role'.
+        """Verifies that ``delegated_metadata`` is signed with the required
+        threshold of keys for the delegated role ``delegated_role``.
 
         Args:
             delegated_role: Name of the delegated role to verify
-            delegated_metadata: The Metadata object for the delegated role
-            signed_serializer: Optional; serializer used for delegate
-                serialization. Default is CanonicalJSONSerializer.
+            delegated_metadata: ``Metadata`` object for the delegated role
+            signed_serializer: Serializer used for delegate
+                serialization. Default is ``CanonicalJSONSerializer``.
 
         Raises:
-            UnsignedMetadataError: 'delegate' was not signed with required
-                threshold of keys for 'role_name'
+            UnsignedMetadataError: ``delegated_role`` was not signed with
+                required threshold of keys for ``role_name``.
+            ValueError: no delegation was found for ``delegated_role``.
+            TypeError: called this function on non-delegating metadata class.
         """
 
         # Find the keys and role in delegator metadata
@@ -339,10 +421,7 @@ class Metadata(Generic[T]):
                 raise ValueError(f"No delegation found for {delegated_role}")
 
             keys = self.signed.delegations.keys
-            roles = self.signed.delegations.roles
-            # Assume role names are unique in delegations.roles: #1426
-            # Find first role in roles with matching name (or None if no match)
-            role = next((r for r in roles if r.name == delegated_role), None)
+            role = self.signed.delegations.roles.get(delegated_role)
         else:
             raise TypeError("Call is valid only on delegator metadata")
 
@@ -363,65 +442,102 @@ class Metadata(Generic[T]):
             raise exceptions.UnsignedMetadataError(
                 f"{delegated_role} was signed by {len(signing_keys)}/"
                 f"{role.threshold} keys",
-                delegated_metadata.signed,
             )
 
 
 class Signed(metaclass=abc.ABCMeta):
     """A base class for the signed part of TUF metadata.
 
-    Objects with base class Signed are usually included in a Metadata object
+    Objects with base class Signed are usually included in a ``Metadata`` object
     on the signed attribute. This class provides attributes and methods that
     are common for all TUF metadata types (roles).
 
-    Attributes:
-        _type: The metadata type string. Also available without underscore.
-        version: The metadata version number.
-        spec_version: The TUF specification version number (semver) the
-            metadata format adheres to.
-        expires: The metadata expiration datetime object.
-        unrecognized_fields: Dictionary of all unrecognized fields.
+    *All parameters named below are not just constructor arguments but also
+    instance attributes.*
+
+    Args:
+        version: Metadata version number. If None, then 1 is assigned.
+        spec_version: Supported TUF specification version. If None, then the
+            version currently supported by the library is assigned.
+        expires: Metadata expiry date. If None, then current date and time is
+            assigned.
+        unrecognized_fields: Dictionary of all attributes that are not managed
+            by TUF Metadata API
+
+    Raises:
+        ValueError: Invalid arguments.
     """
 
-    # Signed implementations are expected to override this
-    _signed_type: ClassVar[str] = "signed"
+    # type is required for static reference without changing the API
+    type: ClassVar[str] = "signed"
 
     # _type and type are identical: 1st replicates file format, 2nd passes lint
     @property
     def _type(self) -> str:
-        return self._signed_type
+        return self.type
 
     @property
-    def type(self) -> str:
-        return self._signed_type
+    def expires(self) -> datetime:
+        """The metadata expiry date::
+
+        # Use 'datetime' module to e.g. expire in seven days from now
+        obj.expires = utcnow() + timedelta(days=7)
+        """
+        return self._expires
+
+    @expires.setter
+    def expires(self, value: datetime) -> None:
+        self._expires = value.replace(microsecond=0)
 
     # NOTE: Signed is a stupid name, because this might not be signed yet, but
     # we keep it to match spec terminology (I often refer to this as "payload",
     # or "inner metadata")
     def __init__(
         self,
-        version: int,
-        spec_version: str,
-        expires: datetime,
-        unrecognized_fields: Optional[Mapping[str, Any]] = None,
-    ) -> None:
+        version: Optional[int],
+        spec_version: Optional[str],
+        expires: Optional[datetime],
+        unrecognized_fields: Optional[Dict[str, Any]],
+    ):
+        if spec_version is None:
+            spec_version = ".".join(SPECIFICATION_VERSION)
+        # Accept semver (X.Y.Z) but also X.Y for legacy compatibility
         spec_list = spec_version.split(".")
-        if (
-            len(spec_list) != 3
-            or not all(el.isdigit() for el in spec_list)
-            or spec_list[0] != SPECIFICATION_VERSION[0]
+        if len(spec_list) not in [2, 3] or not all(
+            el.isdigit() for el in spec_list
         ):
-            raise ValueError(
-                f"Unsupported spec_version, got {spec_list}, "
-                f"supported {'.'.join(SPECIFICATION_VERSION)}"
-            )
-        self.spec_version = spec_version
-        self.expires = expires
+            raise ValueError(f"Failed to parse spec_version {spec_version}")
 
-        if version <= 0:
+        # major version must match
+        if spec_list[0] != SPECIFICATION_VERSION[0]:
+            raise ValueError(f"Unsupported spec_version {spec_version}")
+
+        self.spec_version = spec_version
+
+        self.expires = expires or datetime.utcnow()
+
+        if version is None:
+            version = 1
+        elif version <= 0:
             raise ValueError(f"version must be > 0, got {version}")
         self.version = version
-        self.unrecognized_fields: Mapping[str, Any] = unrecognized_fields or {}
+
+        if unrecognized_fields is None:
+            unrecognized_fields = {}
+
+        self.unrecognized_fields = unrecognized_fields
+
+    def __eq__(self, other: Any) -> bool:
+        if not isinstance(other, Signed):
+            return False
+
+        return (
+            self.type == other.type
+            and self.version == other.version
+            and self.spec_version == other.spec_version
+            and self.expires == other.expires
+            and self.unrecognized_fields == other.unrecognized_fields
+        )
 
     @abc.abstractmethod
     def to_dict(self) -> Dict[str, Any]:
@@ -431,23 +547,23 @@ class Signed(metaclass=abc.ABCMeta):
     @classmethod
     @abc.abstractmethod
     def from_dict(cls, signed_dict: Dict[str, Any]) -> "Signed":
-        """Deserialization helper, creates object from dict representation"""
+        """Deserialization helper, creates object from json/dict representation"""
         raise NotImplementedError
 
     @classmethod
     def _common_fields_from_dict(
         cls, signed_dict: Dict[str, Any]
     ) -> Tuple[int, str, datetime]:
-        """Returns common fields of 'Signed' instances from the passed dict
+        """Returns common fields of ``Signed`` instances from the passed dict
         representation, and returns an ordered list to be passed as leading
         positional arguments to a subclass constructor.
 
-        See '{Root, Timestamp, Snapshot, Targets}.from_dict' methods for usage.
+        See ``{Root, Timestamp, Snapshot, Targets}.from_dict`` methods for usage.
 
         """
         _type = signed_dict.pop("_type")
-        if _type != cls._signed_type:
-            raise ValueError(f"Expected type {cls._signed_type}, got {_type}")
+        if _type != cls.type:
+            raise ValueError(f"Expected type {cls.type}, got {_type}")
 
         version = signed_dict.pop("version")
         spec_version = signed_dict.pop("spec_version")
@@ -456,12 +572,13 @@ class Signed(metaclass=abc.ABCMeta):
         # what the constructor expects and what we store. The inverse operation
         # is implemented in '_common_fields_to_dict'.
         expires = datetime.strptime(expires_str, "%Y-%m-%dT%H:%M:%SZ")
+
         return version, spec_version, expires
 
     def _common_fields_to_dict(self) -> Dict[str, Any]:
-        """Returns dict representation of common fields of 'Signed' instances.
+        """Returns dict representation of common fields of ``Signed`` instances.
 
-        See '{Root, Timestamp, Snapshot, Targets}.to_dict' methods for usage.
+        See ``{Root, Timestamp, Snapshot, Targets}.to_dict`` methods for usage.
 
         """
         return {
@@ -476,44 +593,40 @@ class Signed(metaclass=abc.ABCMeta):
         """Checks metadata expiration against a reference time.
 
         Args:
-            reference_time: Optional; The time to check expiration date against.
-                A naive datetime in UTC expected.
-                If not provided, checks against the current UTC date and time.
+            reference_time: Time to check expiration date against. A naive
+                datetime in UTC expected. Default is current UTC date and time.
 
         Returns:
-            True if expiration time is less than the reference time.
+            ``True`` if expiration time is less than the reference time.
         """
         if reference_time is None:
             reference_time = datetime.utcnow()
 
         return reference_time >= self.expires
 
-    # Modification.
-    def bump_expiration(self, delta: timedelta = timedelta(days=1)) -> None:
-        """Increments the expires attribute by the passed timedelta."""
-        self.expires += delta
-
-    def bump_version(self) -> None:
-        """Increments the metadata version number by 1."""
-        self.version += 1
-
 
 class Key:
     """A container class representing the public portion of a Key.
 
-    Please note that "Key" instances are not semanticly validated during
-    initialization: this only happens at signature verification time.
+    Supported key content (type, scheme and keyval) is defined in
+    `` Securesystemslib``.
 
-    Attributes:
-        keyid: An identifier string that must uniquely identify a key within
-            the metadata it is used in. This implementation does not verify
-            that keyid is the hash of a specific representation of the key.
-        keytype: A string denoting a public key signature system,
-            such as "rsa", "ed25519", "ecdsa" and "ecdsa-sha2-nistp256".
-        scheme: A string denoting a corresponding signature scheme. For example:
+    *All parameters named below are not just constructor arguments but also
+    instance attributes.*
+
+    Args:
+        keyid: Key identifier that is unique within the metadata it is used in.
+            Keyid is not verified to be the hash of a specific representation
+            of the key.
+        keytype: Key type, e.g. "rsa", "ed25519" or "ecdsa-sha2-nistp256".
+        scheme: Signature scheme. For example:
             "rsassa-pss-sha256", "ed25519", and "ecdsa-sha2-nistp256".
-        keyval: A dictionary containing the public portion of the key.
-        unrecognized_fields: Dictionary of all unrecognized fields.
+        keyval: Opaque key content
+        unrecognized_fields: Dictionary of all attributes that are not managed
+            by TUF Metadata API
+
+    Raises:
+        TypeError: Invalid type for an argument.
     """
 
     def __init__(
@@ -522,21 +635,40 @@ class Key:
         keytype: str,
         scheme: str,
         keyval: Dict[str, str],
-        unrecognized_fields: Optional[Mapping[str, Any]] = None,
-    ) -> None:
+        unrecognized_fields: Optional[Dict[str, Any]] = None,
+    ):
         if not all(
             isinstance(at, str) for at in [keyid, keytype, scheme]
-        ) or not isinstance(keyval, Dict):
+        ) or not isinstance(keyval, dict):
             raise TypeError("Unexpected Key attributes types!")
         self.keyid = keyid
         self.keytype = keytype
         self.scheme = scheme
         self.keyval = keyval
-        self.unrecognized_fields: Mapping[str, Any] = unrecognized_fields or {}
+        if unrecognized_fields is None:
+            unrecognized_fields = {}
+
+        self.unrecognized_fields = unrecognized_fields
+
+    def __eq__(self, other: Any) -> bool:
+        if not isinstance(other, Key):
+            return False
+
+        return (
+            self.keyid == other.keyid
+            and self.keytype == other.keytype
+            and self.scheme == other.scheme
+            and self.keyval == other.keyval
+            and self.unrecognized_fields == other.unrecognized_fields
+        )
 
     @classmethod
     def from_dict(cls, keyid: str, key_dict: Dict[str, Any]) -> "Key":
-        """Creates Key object from its dict representation."""
+        """Creates ``Key`` object from its json/dict representation.
+
+        Raises:
+            KeyError, TypeError: Invalid arguments.
+        """
         keytype = key_dict.pop("keytype")
         scheme = key_dict.pop("scheme")
         keyval = key_dict.pop("keyval")
@@ -553,7 +685,7 @@ class Key:
         }
 
     def to_securesystemslib_key(self) -> Dict[str, Any]:
-        """Returns a Securesystemslib compatible representation of self."""
+        """Returns a ``Securesystemslib`` compatible representation of self."""
         return {
             "keyid": self.keyid,
             "keytype": self.keytype,
@@ -563,15 +695,27 @@ class Key:
 
     @classmethod
     def from_securesystemslib_key(cls, key_dict: Dict[str, Any]) -> "Key":
-        """
-        Creates a Key object from a securesystemlib key dict representation
+        """Creates a ``Key`` object from a securesystemlib key json/dict representation
         removing the private key from keyval.
+
+        Args:
+            key_dict: Key in securesystemlib dict representation.
+
+        Raises:
+            ValueError: ``key_dict`` value is not following the securesystemslib
+                format.
         """
-        key_meta = sslib_keys.format_keyval_to_metadata(
-            key_dict["keytype"],
-            key_dict["scheme"],
-            key_dict["keyval"],
-        )
+        try:
+            key_meta = sslib_keys.format_keyval_to_metadata(
+                key_dict["keytype"],
+                key_dict["scheme"],
+                key_dict["keyval"],
+            )
+        except sslib_exceptions.FormatError as e:
+            raise ValueError(
+                "key_dict value is not following the securesystemslib format"
+            ) from e
+
         return cls(
             key_dict["keyid"],
             key_meta["keytype"],
@@ -584,13 +728,13 @@ class Key:
         metadata: Metadata,
         signed_serializer: Optional[SignedSerializer] = None,
     ) -> None:
-        """Verifies that the 'metadata.signatures' contains a signature made
-        with this key, correctly signing 'metadata.signed'.
+        """Verifies that the ``metadata.signatures`` contains a signature made
+        with this key, correctly signing ``metadata.signed``.
 
-        Arguments:
+        Args:
             metadata: Metadata to verify
-            signed_serializer: Optional; SignedSerializer to serialize
-                'metadata.signed' with. Default is CanonicalJSONSerializer.
+            signed_serializer: ``SignedSerializer`` to serialize
+                ``metadata.signed`` with. Default is ``CanonicalJSONSerializer``.
 
         Raises:
             UnsignedMetadataError: The signature could not be verified for a
@@ -600,8 +744,7 @@ class Key:
             signature = metadata.signatures[self.keyid]
         except KeyError:
             raise exceptions.UnsignedMetadataError(
-                f"no signature for key {self.keyid} found in metadata",
-                metadata.signed,
+                f"No signature for key {self.keyid} found in metadata"
             ) from None
 
         if signed_serializer is None:
@@ -617,17 +760,18 @@ class Key:
                 signed_serializer.serialize(metadata.signed),
             ):
                 raise exceptions.UnsignedMetadataError(
-                    f"Failed to verify {self.keyid} signature",
-                    metadata.signed,
+                    f"Failed to verify {self.keyid} signature"
                 )
         except (
             sslib_exceptions.CryptoError,
             sslib_exceptions.FormatError,
             sslib_exceptions.UnsupportedAlgorithmError,
+            SerializationError,
         ) as e:
+            # Log unexpected failure, but continue as if there was no signature
+            logger.info("Key %s failed to verify sig: %s", self.keyid, str(e))
             raise exceptions.UnsignedMetadataError(
-                f"Failed to verify {self.keyid} signature",
-                metadata.signed,
+                f"Failed to verify {self.keyid} signature"
             ) from e
 
 
@@ -637,33 +781,53 @@ class Role:
     Role defines how many keys are required to successfully sign the roles
     metadata, and which keys are accepted.
 
-    Attributes:
-        keyids: A set of strings representing signing keys for this role.
+    *All parameters named below are not just constructor arguments but also
+    instance attributes.*
+
+    Args:
+        keyids: Roles signing key identifiers.
         threshold: Number of keys required to sign this role's metadata.
-        unrecognized_fields: Dictionary of all unrecognized fields.
+        unrecognized_fields: Dictionary of all attributes that are not managed
+            by TUF Metadata API
+
+    Raises:
+        ValueError: Invalid arguments.
     """
 
     def __init__(
         self,
         keyids: List[str],
         threshold: int,
-        unrecognized_fields: Optional[Mapping[str, Any]] = None,
-    ) -> None:
-        keyids_set = set(keyids)
-        if len(keyids_set) != len(keyids):
-            raise ValueError(
-                f"keyids should be a list of unique strings,"
-                f" instead got {keyids}"
-            )
+        unrecognized_fields: Optional[Dict[str, Any]] = None,
+    ):
+        if len(set(keyids)) != len(keyids):
+            raise ValueError(f"Nonunique keyids: {keyids}")
         if threshold < 1:
             raise ValueError("threshold should be at least 1!")
-        self.keyids = keyids_set
+        self.keyids = keyids
         self.threshold = threshold
-        self.unrecognized_fields: Mapping[str, Any] = unrecognized_fields or {}
+        if unrecognized_fields is None:
+            unrecognized_fields = {}
+
+        self.unrecognized_fields = unrecognized_fields
+
+    def __eq__(self, other: Any) -> bool:
+        if not isinstance(other, Role):
+            return False
+
+        return (
+            self.keyids == other.keyids
+            and self.threshold == other.threshold
+            and self.unrecognized_fields == other.unrecognized_fields
+        )
 
     @classmethod
     def from_dict(cls, role_dict: Dict[str, Any]) -> "Role":
-        """Creates Role object from its dict representation."""
+        """Creates ``Role`` object from its json/dict representation.
+
+        Raises:
+            ValueError, KeyError: Invalid arguments.
+        """
         keyids = role_dict.pop("keyids")
         threshold = role_dict.pop("threshold")
         # All fields left in the role_dict are unrecognized.
@@ -672,7 +836,7 @@ class Role:
     def to_dict(self) -> Dict[str, Any]:
         """Returns the dictionary representation of self."""
         return {
-            "keyids": sorted(self.keyids),
+            "keyids": self.keyids,
             "threshold": self.threshold,
             **self.unrecognized_fields,
         }
@@ -681,36 +845,68 @@ class Role:
 class Root(Signed):
     """A container for the signed part of root metadata.
 
-    Attributes:
-        consistent_snapshot: An optional boolean indicating whether the
-            repository supports consistent snapshots.
-        keys: Dictionary of keyids to Keys. Defines the keys used in 'roles'.
+    Parameters listed below are also instance attributes.
+
+    Args:
+        version: Metadata version number. Default is 1.
+        spec_version: Supported TUF specification version. Default is the
+            version currently supported by the library.
+        expires: Metadata expiry date. Default is current date and time.
+        keys: Dictionary of keyids to Keys. Defines the keys used in ``roles``.
+            Default is empty dictionary.
         roles: Dictionary of role names to Roles. Defines which keys are
-            required to sign the metadata for a specific role.
+            required to sign the metadata for a specific role. Default is
+            a dictionary of top level roles without keys and threshold of 1.
+        consistent_snapshot: ``True`` if repository supports consistent snapshots.
+            Default is True.
+        unrecognized_fields: Dictionary of all attributes that are not managed
+            by TUF Metadata API
+
+    Raises:
+        ValueError: Invalid arguments.
     """
 
-    _signed_type = "root"
+    type = _ROOT
 
-    # TODO: determine an appropriate value for max-args
     # pylint: disable=too-many-arguments
     def __init__(
         self,
-        version: int,
-        spec_version: str,
-        expires: datetime,
-        keys: Dict[str, Key],
-        roles: Dict[str, Role],
-        consistent_snapshot: Optional[bool] = None,
-        unrecognized_fields: Optional[Mapping[str, Any]] = None,
-    ) -> None:
+        version: Optional[int] = None,
+        spec_version: Optional[str] = None,
+        expires: Optional[datetime] = None,
+        keys: Optional[Dict[str, Key]] = None,
+        roles: Optional[Mapping[str, Role]] = None,
+        consistent_snapshot: Optional[bool] = True,
+        unrecognized_fields: Optional[Dict[str, Any]] = None,
+    ):
         super().__init__(version, spec_version, expires, unrecognized_fields)
         self.consistent_snapshot = consistent_snapshot
-        self.keys = keys
+        self.keys = keys if keys is not None else {}
+
+        if roles is None:
+            roles = {r: Role([], 1) for r in TOP_LEVEL_ROLE_NAMES}
+        elif set(roles) != TOP_LEVEL_ROLE_NAMES:
+            raise ValueError("Role names must be the top-level metadata roles")
         self.roles = roles
+
+    def __eq__(self, other: Any) -> bool:
+        if not isinstance(other, Root):
+            return False
+
+        return (
+            super().__eq__(other)
+            and self.keys == other.keys
+            and self.roles == other.roles
+            and self.consistent_snapshot == other.consistent_snapshot
+        )
 
     @classmethod
     def from_dict(cls, signed_dict: Dict[str, Any]) -> "Root":
-        """Creates Root object from its dict representation."""
+        """Creates ``Root`` object from its json/dict representation.
+
+        Raises:
+            ValueError, KeyError, TypeError: Invalid arguments.
+        """
         common_args = cls._common_fields_from_dict(signed_dict)
         consistent_snapshot = signed_dict.pop("consistent_snapshot", None)
         keys = signed_dict.pop("keys")
@@ -742,18 +938,37 @@ class Root(Signed):
         )
         return root_dict
 
-    # Update key for a role.
     def add_key(self, role: str, key: Key) -> None:
-        """Adds new signing key for delegated role 'role'."""
-        self.roles[role].keyids.add(key.keyid)
+        """Adds new signing key for delegated role ``role``.
+
+        Args:
+            role: Name of the role, for which ``key`` is added.
+            key: Signing key to be added for ``role``.
+
+        Raises:
+            ValueError: If ``role`` doesn't exist.
+        """
+        if role not in self.roles:
+            raise ValueError(f"Role {role} doesn't exist")
+        if key.keyid not in self.roles[role].keyids:
+            self.roles[role].keyids.append(key.keyid)
         self.keys[key.keyid] = key
 
     def remove_key(self, role: str, keyid: str) -> None:
-        """Removes key from 'role' and updates the key store.
+        """Removes key from ``role`` and updates the key store.
+
+        Args:
+            role: Name of the role, for which a signing key is removed.
+            keyid: Identifier of the key to be removed for ``role``.
 
         Raises:
-            KeyError: If 'role' does not include the key
+            ValueError: If ``role`` doesn't exist or if ``role`` doesn't include
+                the key.
         """
+        if role not in self.roles:
+            raise ValueError(f"Role {role} doesn't exist")
+        if keyid not in self.roles[role].keyids:
+            raise ValueError(f"Key with id {keyid} is not used by {role}")
         self.roles[role].keyids.remove(keyid)
         for keyinfo in self.roles.values():
             if keyid in keyinfo.keyids:
@@ -763,7 +978,7 @@ class Root(Signed):
 
 
 class BaseFile:
-    """A base class of MetaFile and TargetFile.
+    """A base class of ``MetaFile`` and ``TargetFile``.
 
     Encapsulates common static methods for length and hash verification.
     """
@@ -772,7 +987,7 @@ class BaseFile:
     def _verify_hashes(
         data: Union[bytes, IO[bytes]], expected_hashes: Dict[str, str]
     ) -> None:
-        """Verifies that the hash of 'data' matches 'expected_hashes'"""
+        """Verifies that the hash of ``data`` matches ``expected_hashes``"""
         is_bytes = isinstance(data, bytes)
         for algo, exp_hash in expected_hashes.items():
             try:
@@ -793,7 +1008,7 @@ class BaseFile:
             observed_hash = digest_object.hexdigest()
             if observed_hash != exp_hash:
                 raise exceptions.LengthOrHashMismatchError(
-                    f"Observed hash {observed_hash} does not match"
+                    f"Observed hash {observed_hash} does not match "
                     f"expected hash {exp_hash}"
                 )
 
@@ -801,7 +1016,7 @@ class BaseFile:
     def _verify_length(
         data: Union[bytes, IO[bytes]], expected_length: int
     ) -> None:
-        """Verifies that the length of 'data' matches 'expected_length'"""
+        """Verifies that the length of ``data`` matches ``expected_length``"""
         if isinstance(data, bytes):
             observed_length = len(data)
         else:
@@ -811,7 +1026,7 @@ class BaseFile:
 
         if observed_length != expected_length:
             raise exceptions.LengthOrHashMismatchError(
-                f"Observed length {observed_length} does not match"
+                f"Observed length {observed_length} does not match "
                 f"expected length {expected_length}"
             )
 
@@ -832,11 +1047,19 @@ class BaseFile:
 class MetaFile(BaseFile):
     """A container with information about a particular metadata file.
 
-    Attributes:
-        version: An integer indicating the version of the metadata file.
-        length: An optional integer indicating the length of the metadata file.
-        hashes: An optional dictionary of hash algorithm names to hash values.
-        unrecognized_fields: Dictionary of all unrecognized fields.
+    *All parameters named below are not just constructor arguments but also
+    instance attributes.*
+
+    Args:
+        version: Version of the metadata file.
+        length: Length of the metadata file in bytes.
+        hashes: Dictionary of hash algorithm names to hashes of the metadata
+            file content.
+        unrecognized_fields: Dictionary of all attributes that are not managed
+            by TUF Metadata API
+
+    Raises:
+        ValueError, TypeError: Invalid arguments.
     """
 
     def __init__(
@@ -844,8 +1067,8 @@ class MetaFile(BaseFile):
         version: int,
         length: Optional[int] = None,
         hashes: Optional[Dict[str, str]] = None,
-        unrecognized_fields: Optional[Mapping[str, Any]] = None,
-    ) -> None:
+        unrecognized_fields: Optional[Dict[str, Any]] = None,
+    ):
 
         if version <= 0:
             raise ValueError(f"Metafile version must be > 0, got {version}")
@@ -857,11 +1080,29 @@ class MetaFile(BaseFile):
         self.version = version
         self.length = length
         self.hashes = hashes
-        self.unrecognized_fields: Mapping[str, Any] = unrecognized_fields or {}
+        if unrecognized_fields is None:
+            unrecognized_fields = {}
+
+        self.unrecognized_fields = unrecognized_fields
+
+    def __eq__(self, other: Any) -> bool:
+        if not isinstance(other, MetaFile):
+            return False
+
+        return (
+            self.version == other.version
+            and self.length == other.length
+            and self.hashes == other.hashes
+            and self.unrecognized_fields == other.unrecognized_fields
+        )
 
     @classmethod
     def from_dict(cls, meta_dict: Dict[str, Any]) -> "MetaFile":
-        """Creates MetaFile object from its dict representation."""
+        """Creates ``MetaFile`` object from its json/dict representation.
+
+        Raises:
+            ValueError, KeyError: Invalid arguments.
+        """
         version = meta_dict.pop("version")
         length = meta_dict.pop("length", None)
         hashes = meta_dict.pop("hashes", None)
@@ -885,7 +1126,7 @@ class MetaFile(BaseFile):
         return res_dict
 
     def verify_length_and_hashes(self, data: Union[bytes, IO[bytes]]) -> None:
-        """Verifies that the length and hashes of "data" match expected values.
+        """Verifies that the length and hashes of ``data`` match expected values.
 
         Args:
             data: File object or its content in bytes.
@@ -904,47 +1145,65 @@ class MetaFile(BaseFile):
 class Timestamp(Signed):
     """A container for the signed part of timestamp metadata.
 
-    Timestamp contains information about the snapshot Metadata file.
+    TUF file format uses a dictionary to contain the snapshot information:
+    this is not the case with ``Timestamp.snapshot_meta`` which is a ``MetaFile``.
 
-    Attributes:
-        meta: A dictionary of filenames to MetaFiles. The only valid key value
-            is the snapshot filename, as defined by the specification.
+    *All parameters named below are not just constructor arguments but also
+    instance attributes.*
+
+    Args:
+        version: Metadata version number. Default is 1.
+        spec_version: Supported TUF specification version. Default is the
+            version currently supported by the library.
+        expires: Metadata expiry date. Default is current date and time.
+        unrecognized_fields: Dictionary of all attributes that are not managed
+            by TUF Metadata API
+        snapshot_meta: Meta information for snapshot metadata. Default is a
+            MetaFile with version 1.
+
+    Raises:
+        ValueError: Invalid arguments.
     """
 
-    _signed_type = "timestamp"
+    type = _TIMESTAMP
 
     def __init__(
         self,
-        version: int,
-        spec_version: str,
-        expires: datetime,
-        meta: Dict[str, MetaFile],
-        unrecognized_fields: Optional[Mapping[str, Any]] = None,
-    ) -> None:
+        version: Optional[int] = None,
+        spec_version: Optional[str] = None,
+        expires: Optional[datetime] = None,
+        snapshot_meta: Optional[MetaFile] = None,
+        unrecognized_fields: Optional[Dict[str, Any]] = None,
+    ):
         super().__init__(version, spec_version, expires, unrecognized_fields)
-        self.meta = meta
+        self.snapshot_meta = snapshot_meta or MetaFile(1)
+
+    def __eq__(self, other: Any) -> bool:
+        if not isinstance(other, Timestamp):
+            return False
+
+        return (
+            super().__eq__(other) and self.snapshot_meta == other.snapshot_meta
+        )
 
     @classmethod
     def from_dict(cls, signed_dict: Dict[str, Any]) -> "Timestamp":
-        """Creates Timestamp object from its dict representation."""
+        """Creates ``Timestamp`` object from its json/dict representation.
+
+        Raises:
+            ValueError, KeyError: Invalid arguments.
+        """
         common_args = cls._common_fields_from_dict(signed_dict)
         meta_dict = signed_dict.pop("meta")
-        meta = {"snapshot.json": MetaFile.from_dict(meta_dict["snapshot.json"])}
+        snapshot_meta = MetaFile.from_dict(meta_dict["snapshot.json"])
         # All fields left in the timestamp_dict are unrecognized.
-        return cls(*common_args, meta, signed_dict)
+        return cls(*common_args, snapshot_meta, signed_dict)
 
     def to_dict(self) -> Dict[str, Any]:
         """Returns the dict representation of self."""
         res_dict = self._common_fields_to_dict()
-        res_dict["meta"] = {
-            "snapshot.json": self.meta["snapshot.json"].to_dict()
-        }
+        res_dict["meta"] = {"snapshot.json": self.snapshot_meta.to_dict()}
         return res_dict
-
-    # Modification.
-    def update(self, snapshot_meta: MetaFile) -> None:
-        """Assigns passed info about snapshot metadata to meta dict."""
-        self.meta["snapshot.json"] = snapshot_meta
 
 
 class Snapshot(Signed):
@@ -952,26 +1211,49 @@ class Snapshot(Signed):
 
     Snapshot contains information about all target Metadata files.
 
-    Attributes:
-        meta: A dictionary of target metadata filenames to MetaFile objects.
+    *All parameters named below are not just constructor arguments but also
+    instance attributes.*
+
+    Args:
+        version: Metadata version number. Default is 1.
+        spec_version: Supported TUF specification version. Default is the
+            version currently supported by the library.
+        expires: Metadata expiry date. Default is current date and time.
+        unrecognized_fields: Dictionary of all attributes that are not managed
+            by TUF Metadata API
+        meta: Dictionary of targets filenames to ``MetaFile`` objects. Default
+            is a dictionary with a Metafile for "snapshot.json" version 1.
+
+    Raises:
+        ValueError: Invalid arguments.
     """
 
-    _signed_type = "snapshot"
+    type = _SNAPSHOT
 
     def __init__(
         self,
-        version: int,
-        spec_version: str,
-        expires: datetime,
-        meta: Dict[str, MetaFile],
-        unrecognized_fields: Optional[Mapping[str, Any]] = None,
-    ) -> None:
+        version: Optional[int] = None,
+        spec_version: Optional[str] = None,
+        expires: Optional[datetime] = None,
+        meta: Optional[Dict[str, MetaFile]] = None,
+        unrecognized_fields: Optional[Dict[str, Any]] = None,
+    ):
         super().__init__(version, spec_version, expires, unrecognized_fields)
-        self.meta = meta
+        self.meta = meta if meta is not None else {"targets.json": MetaFile(1)}
+
+    def __eq__(self, other: Any) -> bool:
+        if not isinstance(other, Snapshot):
+            return False
+
+        return super().__eq__(other) and self.meta == other.meta
 
     @classmethod
     def from_dict(cls, signed_dict: Dict[str, Any]) -> "Snapshot":
-        """Creates Snapshot object from its dict representation."""
+        """Creates ``Snapshot`` object from its json/dict representation.
+
+        Raises:
+            ValueError, KeyError: Invalid arguments.
+        """
         common_args = cls._common_fields_from_dict(signed_dict)
         meta_dicts = signed_dict.pop("meta")
         meta = {}
@@ -990,32 +1272,34 @@ class Snapshot(Signed):
         snapshot_dict["meta"] = meta_dict
         return snapshot_dict
 
-    # Modification.
-    def update(self, rolename: str, role_info: MetaFile) -> None:
-        """Assigns passed (delegated) targets role info to meta dict."""
-        metadata_fn = f"{rolename}.json"
-        self.meta[metadata_fn] = role_info
-
 
 class DelegatedRole(Role):
     """A container with information about a delegated role.
 
     A delegation can happen in two ways:
 
-        - paths is set: delegates targets matching any path pattern in paths
-        - path_hash_prefixes is set: delegates targets whose target path hash
-          starts with any of the prefixes in path_hash_prefixes
+        - ``paths`` is set: delegates targets matching any path pattern in ``paths``
+        - ``path_hash_prefixes`` is set: delegates targets whose target path hash
+          starts with any of the prefixes in ``path_hash_prefixes``
 
-        paths and path_hash_prefixes are mutually exclusive: both cannot be set,
-        at least one of them must be set.
+        ``paths`` and ``path_hash_prefixes`` are mutually exclusive: both cannot be
+        set, at least one of them must be set.
 
-    Attributes:
-        name: A string giving the name of the delegated role.
-        terminating: A boolean indicating whether subsequent delegations
-            should be considered during a target lookup.
-        paths: An optional list of path pattern strings. See note above.
-        path_hash_prefixes: An optional list of hash prefixes. See note above.
-        unrecognized_fields: Dictionary of all unrecognized fields.
+    *All parameters named below are not just constructor arguments but also
+    instance attributes.*
+
+    Args:
+        name: Delegated role name.
+        keyids: Delegated role signing key identifiers.
+        threshold: Number of keys required to sign this role's metadata.
+        terminating: ``True`` if this delegation terminates a target lookup.
+        paths: Path patterns. See note above.
+        path_hash_prefixes: Hash prefixes. See note above.
+        unrecognized_fields: Dictionary of all attributes that are not managed
+            by TUF Metadata API
+
+    Raises:
+        ValueError: Invalid arguments.
     """
 
     def __init__(
@@ -1026,8 +1310,8 @@ class DelegatedRole(Role):
         terminating: bool,
         paths: Optional[List[str]] = None,
         path_hash_prefixes: Optional[List[str]] = None,
-        unrecognized_fields: Optional[Mapping[str, Any]] = None,
-    ) -> None:
+        unrecognized_fields: Optional[Dict[str, Any]] = None,
+    ):
         super().__init__(keyids, threshold, unrecognized_fields)
         self.name = name
         self.terminating = terminating
@@ -1037,12 +1321,35 @@ class DelegatedRole(Role):
         if paths is None and path_hash_prefixes is None:
             raise ValueError("One of paths or path_hash_prefixes must be set")
 
+        if paths is not None and any(not isinstance(p, str) for p in paths):
+            raise ValueError("Paths must be strings")
+        if path_hash_prefixes is not None and any(
+            not isinstance(p, str) for p in path_hash_prefixes
+        ):
+            raise ValueError("Path_hash_prefixes must be strings")
+
         self.paths = paths
         self.path_hash_prefixes = path_hash_prefixes
 
+    def __eq__(self, other: Any) -> bool:
+        if not isinstance(other, DelegatedRole):
+            return False
+
+        return (
+            super().__eq__(other)
+            and self.name == other.name
+            and self.terminating == other.terminating
+            and self.paths == other.paths
+            and self.path_hash_prefixes == other.path_hash_prefixes
+        )
+
     @classmethod
     def from_dict(cls, role_dict: Dict[str, Any]) -> "DelegatedRole":
-        """Creates DelegatedRole object from its dict representation."""
+        """Creates ``DelegatedRole`` object from its json/dict representation.
+
+        Raises:
+            ValueError, KeyError: Invalid arguments.
+        """
         name = role_dict.pop("name")
         keyids = role_dict.pop("keyids")
         threshold = role_dict.pop("threshold")
@@ -1076,8 +1383,8 @@ class DelegatedRole(Role):
 
     @staticmethod
     def _is_target_in_pathpattern(targetpath: str, pathpattern: str) -> bool:
-        """Determines whether "targetname" matches the "pathpattern"."""
-        # We need to make sure that targetname and pathpattern are pointing to
+        """Determines whether ``targetpath`` matches the ``pathpattern``."""
+        # We need to make sure that targetpath and pathpattern are pointing to
         # the same directory as fnmatch doesn't threat "/" as a special symbol.
         target_parts = targetpath.split("/")
         pattern_parts = pathpattern.split("/")
@@ -1093,14 +1400,18 @@ class DelegatedRole(Role):
         return True
 
     def is_delegated_path(self, target_filepath: str) -> bool:
-        """Determines whether the given 'target_filepath' is in one of
-        the paths that DelegatedRole is trusted to provide.
+        """Determines whether the given ``target_filepath`` is in one of
+        the paths that ``DelegatedRole`` is trusted to provide.
 
-        The target_filepath and the DelegatedRole paths are expected to be in
-        their canonical forms, so e.g. "a/b" instead of "a//b" . Only "/" is
+        The ``target_filepath`` and the ``DelegatedRole`` paths are expected to be
+        in their canonical forms, so e.g. "a/b" instead of "a//b" . Only "/" is
         supported as target path separator. Leading separators are not handled
         as special cases (see `TUF specification on targetpath
         <https://theupdateframework.github.io/specification/latest/#targetpath>`_).
+
+        Args:
+            target_filepath: URL path to a target file, relative to a base
+                targets URL.
         """
 
         if self.path_hash_prefixes is not None:
@@ -1127,43 +1438,79 @@ class DelegatedRole(Role):
 class Delegations:
     """A container object storing information about all delegations.
 
-    Attributes:
-        keys: Dictionary of keyids to Keys. Defines the keys used in 'roles'.
-        roles: List of DelegatedRoles that define which keys are required to
-            sign the metadata for a specific role. The roles order also
-            defines the order that role delegations are considered in.
-        unrecognized_fields: Dictionary of all unrecognized fields.
+    *All parameters named below are not just constructor arguments but also
+    instance attributes.*
+
+    Args:
+        keys: Dictionary of keyids to Keys. Defines the keys used in ``roles``.
+        roles: Ordered dictionary of role names to DelegatedRoles instances. It
+            defines which keys are required to sign the metadata for a specific
+            role. The roles order also defines the order that role delegations
+            are considered during target searches.
+        unrecognized_fields: Dictionary of all attributes that are not managed
+            by TUF Metadata API
+
+    Raises:
+        ValueError: Invalid arguments.
     """
 
     def __init__(
         self,
         keys: Dict[str, Key],
-        roles: List[DelegatedRole],
-        unrecognized_fields: Optional[Mapping[str, Any]] = None,
-    ) -> None:
+        roles: Dict[str, DelegatedRole],
+        unrecognized_fields: Optional[Dict[str, Any]] = None,
+    ):
         self.keys = keys
+
+        for role in roles:
+            if not role or role in TOP_LEVEL_ROLE_NAMES:
+                raise ValueError(
+                    "Delegated roles cannot be empty or use top-level role names"
+                )
+
         self.roles = roles
-        self.unrecognized_fields = unrecognized_fields or {}
+        if unrecognized_fields is None:
+            unrecognized_fields = {}
+
+        self.unrecognized_fields = unrecognized_fields
+
+    def __eq__(self, other: Any) -> bool:
+        if not isinstance(other, Delegations):
+            return False
+
+        return (
+            self.keys == other.keys
+            # Order of the delegated roles matters (see issue #1788).
+            and list(self.roles.items()) == list(other.roles.items())
+            and self.roles == other.roles
+            and self.unrecognized_fields == other.unrecognized_fields
+        )
 
     @classmethod
     def from_dict(cls, delegations_dict: Dict[str, Any]) -> "Delegations":
-        """Creates Delegations object from its dict representation."""
+        """Creates ``Delegations`` object from its json/dict representation.
+
+        Raises:
+            ValueError, KeyError, TypeError: Invalid arguments.
+        """
         keys = delegations_dict.pop("keys")
         keys_res = {}
         for keyid, key_dict in keys.items():
             keys_res[keyid] = Key.from_dict(keyid, key_dict)
         roles = delegations_dict.pop("roles")
-        roles_res = []
+        roles_res: Dict[str, DelegatedRole] = {}
         for role_dict in roles:
             new_role = DelegatedRole.from_dict(role_dict)
-            roles_res.append(new_role)
+            if new_role.name in roles_res:
+                raise ValueError(f"Duplicate role {new_role.name}")
+            roles_res[new_role.name] = new_role
         # All fields left in the delegations_dict are unrecognized.
         return cls(keys_res, roles_res, delegations_dict)
 
     def to_dict(self) -> Dict[str, Any]:
         """Returns the dict representation of self."""
         keys = {keyid: key.to_dict() for keyid, key in self.keys.items()}
-        roles = [role_obj.to_dict() for role_obj in self.roles]
+        roles = [role_obj.to_dict() for role_obj in self.roles.values()]
         return {
             "keys": keys,
             "roles": roles,
@@ -1174,12 +1521,19 @@ class Delegations:
 class TargetFile(BaseFile):
     """A container with information about a particular target file.
 
-    Attributes:
-        length: An integer indicating the length of the target file.
-        hashes: A dictionary of hash algorithm names to hash values.
-        path: A string denoting the path to a target file relative to a base
-            URL of targets.
-        unrecognized_fields: Dictionary of all unrecognized fields.
+    *All parameters named below are not just constructor arguments but also
+    instance attributes.*
+
+    Args:
+        length: Length of the target file in bytes.
+        hashes: Dictionary of hash algorithm names to hashes of the target
+            file content.
+        path: URL path to a target file, relative to a base targets URL.
+        unrecognized_fields: Dictionary of all attributes that are not managed
+            by TUF Metadata API
+
+    Raises:
+        ValueError, TypeError: Invalid arguments.
     """
 
     def __init__(
@@ -1187,8 +1541,8 @@ class TargetFile(BaseFile):
         length: int,
         hashes: Dict[str, str],
         path: str,
-        unrecognized_fields: Optional[Mapping[str, Any]] = None,
-    ) -> None:
+        unrecognized_fields: Optional[Dict[str, Any]] = None,
+    ):
 
         self._validate_length(length)
         self._validate_hashes(hashes)
@@ -1196,15 +1550,35 @@ class TargetFile(BaseFile):
         self.length = length
         self.hashes = hashes
         self.path = path
-        self.unrecognized_fields = unrecognized_fields or {}
+        if unrecognized_fields is None:
+            unrecognized_fields = {}
+
+        self.unrecognized_fields = unrecognized_fields
 
     @property
     def custom(self) -> Any:
-        return self.unrecognized_fields.get("custom", None)
+        """Can be used to provide implementation specific data related to the
+        target. python-tuf does not use or validate this data."""
+        return self.unrecognized_fields.get("custom")
+
+    def __eq__(self, other: Any) -> bool:
+        if not isinstance(other, TargetFile):
+            return False
+
+        return (
+            self.length == other.length
+            and self.hashes == other.hashes
+            and self.path == other.path
+            and self.unrecognized_fields == other.unrecognized_fields
+        )
 
     @classmethod
     def from_dict(cls, target_dict: Dict[str, Any], path: str) -> "TargetFile":
-        """Creates TargetFile object from its dict representation."""
+        """Creates ``TargetFile`` object from its json/dict representation.
+
+        Raises:
+            ValueError, KeyError, TypeError: Invalid arguments.
+        """
         length = target_dict.pop("length")
         hashes = target_dict.pop("hashes")
 
@@ -1219,11 +1593,84 @@ class TargetFile(BaseFile):
             **self.unrecognized_fields,
         }
 
-    def verify_length_and_hashes(self, data: Union[bytes, IO[bytes]]) -> None:
-        """Verifies that length and hashes of "data" match expected values.
+    @classmethod
+    def from_file(
+        cls,
+        target_file_path: str,
+        local_path: str,
+        hash_algorithms: Optional[List[str]] = None,
+    ) -> "TargetFile":
+        """Creates ``TargetFile`` object from a file.
 
         Args:
-            data: File object or its content in bytes.
+            target_file_path: URL path to a target file, relative to a base
+                targets URL.
+            local_path: Local path to target file content.
+            hash_algorithms: Hash algorithms to calculate hashes with. If not
+                specified the securesystemslib default hash algorithm is used.
+        Raises:
+            FileNotFoundError: The file doesn't exist.
+            ValueError: The hash algorithms list contains an unsupported
+                algorithm.
+        """
+        with open(local_path, "rb") as file:
+            return cls.from_data(target_file_path, file, hash_algorithms)
+
+    @classmethod
+    def from_data(
+        cls,
+        target_file_path: str,
+        data: Union[bytes, IO[bytes]],
+        hash_algorithms: Optional[List[str]] = None,
+    ) -> "TargetFile":
+        """Creates ``TargetFile`` object from bytes.
+
+        Args:
+            target_file_path: URL path to a target file, relative to a base
+                targets URL.
+            data: Target file content.
+            hash_algorithms: Hash algorithms to create the hashes with. If not
+                specified the securesystemslib default hash algorithm is used.
+
+        Raises:
+            ValueError: The hash algorithms list contains an unsupported
+                algorithm.
+        """
+        if isinstance(data, bytes):
+            length = len(data)
+        else:
+            data.seek(0, io.SEEK_END)
+            length = data.tell()
+
+        hashes = {}
+
+        if hash_algorithms is None:
+            hash_algorithms = [sslib_hash.DEFAULT_HASH_ALGORITHM]
+
+        for algorithm in hash_algorithms:
+            try:
+                if isinstance(data, bytes):
+                    digest_object = sslib_hash.digest(algorithm)
+                    digest_object.update(data)
+                else:
+                    digest_object = sslib_hash.digest_fileobject(
+                        data, algorithm
+                    )
+            except (
+                sslib_exceptions.UnsupportedAlgorithmError,
+                sslib_exceptions.FormatError,
+            ) as e:
+                raise ValueError(f"Unsupported algorithm '{algorithm}'") from e
+
+            hashes[algorithm] = digest_object.hexdigest()
+
+        return cls(length, hashes, target_file_path)
+
+    def verify_length_and_hashes(self, data: Union[bytes, IO[bytes]]) -> None:
+        """Verifies that length and hashes of ``data`` match expected values.
+
+        Args:
+            data: Target file object or its content in bytes.
 
         Raises:
             LengthOrHashMismatchError: Calculated length or hashes do not
@@ -1239,34 +1686,60 @@ class Targets(Signed):
     Targets contains verifying information about target files and also
     delegates responsibility to other Targets roles.
 
-    Attributes:
-        targets: A dictionary of target filenames to TargetFiles
-        delegations: An optional Delegations that defines how this Targets
-            further delegates responsibility to other Targets Metadata files.
+    *All parameters named below are not just constructor arguments but also
+    instance attributes.*
+
+    Args:
+        version: Metadata version number. Default is 1.
+        spec_version: Supported TUF specification version. Default is the
+            version currently supported by the library.
+        expires: Metadata expiry date. Default is current date and time.
+        targets: Dictionary of target filenames to TargetFiles. Default is an
+            empty dictionary.
+        delegations: Defines how this Targets delegates responsibility to other
+            Targets Metadata files. Default is None.
+        unrecognized_fields: Dictionary of all attributes that are not managed
+            by TUF Metadata API
+
+    Raises:
+        ValueError: Invalid arguments.
     """
 
-    _signed_type = "targets"
+    type = _TARGETS
 
-    # TODO: determine an appropriate value for max-args
     # pylint: disable=too-many-arguments
     def __init__(
         self,
-        version: int,
-        spec_version: str,
-        expires: datetime,
-        targets: Dict[str, TargetFile],
+        version: Optional[int] = None,
+        spec_version: Optional[str] = None,
+        expires: Optional[datetime] = None,
+        targets: Optional[Dict[str, TargetFile]] = None,
         delegations: Optional[Delegations] = None,
-        unrecognized_fields: Optional[Mapping[str, Any]] = None,
+        unrecognized_fields: Optional[Dict[str, Any]] = None,
     ) -> None:
         super().__init__(version, spec_version, expires, unrecognized_fields)
-        self.targets = targets
+        self.targets = targets if targets is not None else {}
         self.delegations = delegations
+
+    def __eq__(self, other: Any) -> bool:
+        if not isinstance(other, Targets):
+            return False
+
+        return (
+            super().__eq__(other)
+            and self.targets == other.targets
+            and self.delegations == other.delegations
+        )
 
     @classmethod
     def from_dict(cls, signed_dict: Dict[str, Any]) -> "Targets":
-        """Creates Targets object from its dict representation."""
+        """Creates ``Targets`` object from its json/dict representation.
+
+        Raises:
+            ValueError, KeyError, TypeError: Invalid arguments.
+        """
         common_args = cls._common_fields_from_dict(signed_dict)
-        targets = signed_dict.pop("targets")
+        targets = signed_dict.pop(_TARGETS)
         try:
             delegations_dict = signed_dict.pop("delegations")
         except KeyError:
@@ -1287,12 +1760,47 @@ class Targets(Signed):
         targets = {}
         for target_path, target_file_obj in self.targets.items():
             targets[target_path] = target_file_obj.to_dict()
-        targets_dict["targets"] = targets
+        targets_dict[_TARGETS] = targets
         if self.delegations is not None:
             targets_dict["delegations"] = self.delegations.to_dict()
         return targets_dict
 
-    # Modification.
-    def update(self, fileinfo: TargetFile) -> None:
-        """Assigns passed target file info to meta dict."""
-        self.targets[fileinfo.path] = fileinfo
+    def add_key(self, role: str, key: Key) -> None:
+        """Adds new signing key for delegated role ``role``.
+
+        Args:
+            role: Name of the role, for which ``key`` is added.
+            key: Signing key to be added for ``role``.
+
+        Raises:
+            ValueError: If there are no delegated roles or if ``role`` is not
+                delegated by this Target.
+        """
+        if self.delegations is None or role not in self.delegations.roles:
+            raise ValueError(f"Delegated role {role} doesn't exist")
+        if key.keyid not in self.delegations.roles[role].keyids:
+            self.delegations.roles[role].keyids.append(key.keyid)
+        self.delegations.keys[key.keyid] = key
+
+    def remove_key(self, role: str, keyid: str) -> None:
+        """Removes key from delegated role ``role`` and updates the delegations
+        key store.
+
+        Args:
+            role: Name of the role, for which a signing key is removed.
+            keyid: Identifier of the key to be removed for ``role``.
+
+        Raises:
+            ValueError: If there are no delegated roles or if ``role`` is not
+                delegated by this ``Target`` or if key is not used by ``role``.
+        """
+        if self.delegations is None or role not in self.delegations.roles:
+            raise ValueError(f"Delegated role {role} doesn't exist")
+        if keyid not in self.delegations.roles[role].keyids:
+            raise ValueError(f"Key with id {keyid} is not used by {role}")
+        self.delegations.roles[role].keyids.remove(keyid)
+        for keyinfo in self.delegations.roles.values():
+            if keyid in keyinfo.keyids:
+                return
+
+        del self.delegations.keys[keyid]

@@ -1,0 +1,31 @@
+on:
+  schedule:
+    - cron: "0 13 * * *"
+  workflow_dispatch:
+  push:
+name: Specification version check
+jobs:
+  # Get the version of the TUF specification the project states it supports
+  get-supported-tuf-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.get-version.outputs.version }}
+    steps:
+      - uses: actions/checkout@2541b1294d2704b0964813337f33b291d3f8596b
+      - uses: actions/setup-python@98f2ad02fd48d057ee3b4d4f66525b231c3e52b6
+      - id: get-version
+        run: |
+          python3 -m pip install -e .
+          script="from tuf.api.metadata import SPECIFICATION_VERSION; \
+                  print(f\"v{'.'.join(SPECIFICATION_VERSION)}\")"
+          ver=$(python3 -c "$script")
+          echo "::set-output name=version::$ver"
+  # Get the latest TUF specification release and open an issue (if needed)
+  specification-bump-check:
+    permissions:
+      contents: read
+      issues: read
+    needs: get-supported-tuf-version
+    uses: rdimitrov/specification/.github/workflows/check-latest-spec-version.yml@dimitrovr/spec-bump-workflow
+    with:
+      tuf-version: ${{needs.get-supported-tuf-version.outputs.version}}

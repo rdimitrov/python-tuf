@@ -1,5 +1,212 @@
 # Changelog
 
+
+## v1.1.0
+
+This release contains major build improvements as well as fixes and
+backwards-compatible API improvements.
+
+### Added
+* build: Release process was moved to CD platform (#1946, #1971, #1976)
+* build: Build is now reproducible thanks to Hatchling (#1896, #1900)
+* build: Build results are now verifiable (#1913, #1926, #1947, #1979)
+* build: test dependencies are now pinned for reproducibility (#1867, #1918)
+* Metadata API: Validation is now possible during serialization (#1775)
+* Infrastructure: Setup development blog (#1886, #1887)
+
+### Changed
+* Metadata API: Supported specification version updated (#1908, #1960)
+* Metadata API: unrecognized_fields annotation fix (#1950)
+* Metadata API: Constructors are now easier to use (#1922)
+* Metadata API: Logging and error message improvements (#1876)
+* build: Include examples in source distribution (#1970)
+* build: Updated pinned dependency versions
+* tests: Various improvements (#1707, #1758, #1808, #1860, #1915, #1936,
+  #1953, #1954, #1955)
+
+
+## v1.0.0
+
+This release makes ngclient and the Metadata API the supported python-tuf APIs.
+It also removes the legacy implementation as documented in the
+[1.0.0 announcement](1.0.0-ANNOUNCEMENT.md): all library code is now contained
+in `tuf.api` or `tuf.ngclient`.
+
+### Added
+* tests: Extend testing (#1689, #1703, #1711, #1728, #1735, #1738,
+  #1742, #1766, #1777, #1809, #1831)
+
+### Changed
+* Metadata API: Disallow microseconds in expiry (#1712)
+* Metadata API: Preserve role keyid order (#1754)
+* Metadata API: Make exceptions more consistent (#1725, #1734, #1787, #1840,
+  #1836)
+* Metadata API: Update supported spec version to "1.0.28" (#1825)
+* Metadata API: Accept legacy spec version "1.0" (#1796)
+* Metadata API: Accept custom fields in Metadata (#1861)
+* ngclient: Remove temporary file in failure cases (#1757)
+* ngclient: Explicitly encode rolename in URL (#1759)
+* ngclient: Allow HTTP payload compression (#1774)
+* ngclient: Make exceptions more consistent (#1799, #1810)
+* docs: Improve documentation (#1744, #1749, #1750, #1755, #1771, #1776, #1772,
+  #1780, #1781, #1800, #1815, #1820, #1829, #1838, #1850, #1853, #1855, #1856
+  #1868, #1871)
+* build: Various build infrastructure improvements (#1718, #1724, #1760, #1762,
+  #1767, #1803, #1830, #1832, #1837, #1839)
+* build: Stop supporting EOL Python 3.6 (#1783)
+* build: Update dependencies (#1809, #1827, #1834, #1863, #1865, #1870)
+
+### Removed
+* Remove all legacy code including old client, repository_tool, repository_lib
+  and the scripts (#1790)
+* Metadata API: Remove modification helper methods that are no longer necessary
+  (#1736, #1740, #1743)
+* tests: Remove client tests that were replaced with better ones (#1741)
+* tests: Stop using unittest_toolbox (#1792)
+* docs: Remove deprecated documentation (#1768, #1769, #1773, #1848)
+
+
+## v0.20.0
+
+*__NOTE:__ This will be the final release of python-tuf that includes the
+legacy implementation code. Please see the [*1.0.0
+announcement*](1.0.0-ANNOUNCEMENT.md) page for more details about the next
+release and the deprecation of the legacy implementation, including migration
+instructions.*
+
+### Added
+* metadata API: misc input validation (#1630, #1688, #1668, #1672, #1690)
+* doc: repository library design document and ADR (#1693)
+* doc: 1.0.0 announcement (#1706)
+* doc: misc docstrings in metadata API (#1620)
+* doc: repository and client examples (#1675, #1685, #1700)
+* test: ngclient key rotation (#1635, #1649, #1691)
+* test: ngclient top-level role update (#1636)
+* test: ngclient non-consistent snapshot (#1666, #1705)
+* test: more lint/type checks and auto-formatting (#1658, #1664, #1659, #1674,
+        #1677, #1687, #1699, #1701, #1708, #1710, #1720, #1726)
+* build: Python 3.10 support (#1628)
+
+### Changed
+* ngclient: misc API changes (#1604, #1731)
+* ngclient: avoid re-loading verified targets metadata (#1593)
+* ngclient: implicitly call refresh() (#1654)
+* ngclient: return loaded metadata (#1680)
+* ngclient: skip visited nodes on delegation tree traversal (#1683)
+* ngclient: remove URL normalisation (#1686)
+* build: modernise packaging configuration (#1626)
+* build: bump dependencies (#1609, #1611, #1616, #1621)
+* build: limit GitHub Action token visibility and permissions (#1652, #1663)
+* test: misc test changes (#1715, #1670, #1671, #1631, #1695, #1702)
+
+### Removed
+* doc: obsolete roadmap (#1698)
+
+## v0.19.0
+
+For users of legacy client (tuf.client module) this is purely a security fix
+release with no API or functionality changes. For ngclient (tuf.ngclient) and
+Metadata API (tuf.api.metadata), some API changes are included.
+
+**All users are advised to upgrade**.
+
+Note that python-tuf has required python>=3.5 since release 0.18.0.
+
+### Fixed
+* GHSA-wjw6-2cqr-j4qr: Fix client side issue in both legacy client (tuf.client)
+  and ngclient (tuf.ngclient) where a malicious repository could trick client
+  to overwrite files outside the client metadata store during a metadata
+  update. The fix includes percent-encoding the metadata rolename before using
+  it as part of a filename
+  https://github.com/theupdateframework/python-tuf/security/advisories/GHSA-wjw6-2cqr-j4qr
+* ngclient: Do not use urljoin to form metadata URL (included in
+  GHSA-wjw6-2cqr-j4qr)
+* ngclient: Persist metadata safely (#1574)
+* ngclient: Handle timeout on session.get() (#1588)
+
+### Added
+* build: Dependabot now monitors GitHub Actions (#1572)
+* tests: ngclient test improvements (#1564, #1569, #1587)
+* Metadata API: Add TargetFile.from_file() (#1521)
+
+### Changed
+* build: Bump dependency charset-normalizer (#1581, #1586)
+* build: Bump dependency urllib3 (#1589)
+* build: Bump dependency cryptography (#1596)
+* Metadata API: Documentation improvements (#1533, #1590)
+* Metadata API: change Timestamp meta API  (#1446)
+* Metadata API: change Delegations roles API (#1537)
+* ngclient: Remove unnecessary sleep() (#1608)
+* ngclient: Fix consistent targets URL resolution (#1591)
+* ngclient: Don't use target path as local path (#1592)
+
+## v0.18.1
+
+### Changed
+* Update setup.cfg to not build universal wheels (#1566)
+
+## v0.18.0
+
+0.18 is a big release with 3 main themes:
+* Support only Python 3 and modernize the infrastructure accordingly
+* Metadata API (a low-level API for metadata de/serialization and
+  modification) is now feature-complete for the client use cases
+* ngclient (a new high-level client API) was added. ngclient should be
+  considered an unstable API and is not yet recommended for production
+  use.
+
+Additionally the Github project name changed: project is now "python-tuf"
+instead of "tuf". Redirects are in place for the old name but updating links is
+advised.
+
+### Added
+* Add ADR6: Where to implement serialization (#1270)
+* Add ADR8: Unrecognized fields (#1343)
+* Add ADR9: Refine reference implementation purpose (#1554)
+* Add client Network IO abstraction (#1250, #1302)
+* Add many features to Metadata API to support de/serializing
+  specification-compliant metadata, and safer access through API:
+  * Metadata.from_bytes()/to_bytes() (#1354, #1490)
+  * Key, Role (#1360, #1386, #1423, #1480, #1481, #1520)
+  * DelegationRole, Delegations (#1370, #1512)
+  * MetaFile, TargetFile (#1329, #1437, #1454, #1514)
+  * verification of threshold of signatures (#1435, #1436)
+  * expiration check method (#1347)
+  * support unrecognized fields in metadata (#1345)
+  * use Generics to improve static typing (#1457)
+* Extensive Metadata API testing and validation
+  (#1359, #1416, #1416, #1430, #1449, #1450, #1451, #1460, #1466, #1511)
+* Add ngclient: a new client library implementation
+  (#1408, #1448, #1463 #1467, #1470, #1474, #1501, #1509, #1519, #1524)
+* Infrastructure improvements:
+  * mypy, black and isort integration (#1314, #1363, #1395, #1455, #1489)
+  * API reference documentation build (#1517)
+
+### Removed
+* Remove Python 2 support (#1293)
+* Remove direct dependency on six
+* Remove obsolete reference to Thandy in a LICENSE file (#1472)
+
+### Changed
+* Bump dependencies:
+  * Certifi
+  * Cryptography
+  * Idna
+  * Requests
+  * Securesystemslib
+  * Six
+  * Urllib3
+* Replace indirect dependency chardet with charset-normalizer
+* Move Metadata API serialization to sub-package (#1279)
+* Use SecureSystemslib Signer interface in Metadata API (#1272)
+* Make imports compatible with vendoring (#1261)
+
+### Fixed
+* 'ecdsa' is a supported key type (#1453)
+* Fix various build infrastructure issues (#1289, #1295, #1321, #1327, #1364,
+  #1369, #1542)
+* Test fixes (#1337, #1346)
+
 ## v0.17.0
 **NOTE**: this will be the final release of tuf that supports Python 2.7.
 This is because Python 2.7 was marked [end-of-life](

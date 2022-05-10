@@ -30,15 +30,15 @@ master_doc = 'index'
 # Add any Sphinx extension module names here, as strings. They can be
 # extensions coming with Sphinx (named 'sphinx.ext.*') or your custom
 # ones.
-extensions = ['sphinx.ext.napoleon']
+extensions = [
+    'sphinx.ext.napoleon', 'sphinx.ext.autosummary',
+    'sphinx.ext.autosectionlabel'
+]
+
+autosectionlabel_prefix_document = True
 
 # Add any paths that contain templates here, relative to this directory.
 templates_path = ['_templates']
-
-# List of patterns, relative to source directory, that match files and
-# directories to ignore when looking for source files.
-# This pattern also affects html_static_path and html_extra_path.
-exclude_patterns = ['GETTING_STARTED.rst', 'OVERVIEW.rst', 'TAP.rst']
 
 # -- Options for HTML output -------------------------------------------------
 
@@ -46,11 +46,32 @@ exclude_patterns = ['GETTING_STARTED.rst', 'OVERVIEW.rst', 'TAP.rst']
 # a list of builtin themes.
 #
 html_theme = 'sphinx_rtd_theme'
+html_theme_options = {
+  'logo_only': True
+}
+html_logo = 'tuf-horizontal-white.png'
+html_favicon = 'tuf-icon-32.png'
+
 
 # Add any paths that contain custom static files (such as style sheets) here,
 # relative to this directory. They are copied after the builtin static files,
 # so a file named "default.css" will overwrite the builtin "default.css".
 #html_static_path = ['_static']
 
+# -- Autodoc configuration ---------------------------------------------------
+# https://www.sphinx-doc.org/en/master/usage/extensions/autodoc.html
+
 autodoc_mock_imports = ['securesystemslib']
 
+# Tone down the "tuf.api.metadata." repetition
+add_module_names = False
+python_use_unqualified_type_names = True
+
+# Show typehints in argument doc lines, but not in signatures
+autodoc_typehints = "description"
+
+autodoc_default_options = {
+    'members': True,
+    'inherited-members': 'Exception', # excl. members inherited from 'Exception'
+    'exclude-members': 'to_dict, from_dict'
+}
